@@ -1,0 +1,198 @@
+---
+title: "RNA-Seq Differential Expression: Dexamethasone in Airway Smooth Muscle Cells"
+author: "Adnan Warsi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(DESeq2)
+library(airway)
+library(org.Hs.eg.db)
+library(topGO)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(dplyr)
+dir.create("results", showWarnings = FALSE)
+set.seed(42)
+```
+
+# 1. Aim and dataset
+
+**Aim:** find genes whose expression changes when human airway smooth muscle cells are treated with dexamethasone (a glucocorticoid drug), and describe the biological processes involved.
+
+**Data:** public dataset GSE52778 (Himes et al., 2014). Cells from 4 donors, each either untreated or treated with 1 uM dexamethasone for 18 hours (8 samples in total). Gene-level read counts come from the Bioconductor `airway` package.
+
+```{r data}
+data(airway)
+dds <- DESeqDataSet(airway, design = ~ cell + dex)
+dds$dex <- relevel(dds$dex, ref = "untrt")
+as.data.frame(colData(dds))[, c("SampleName", "cell", "dex", "Run")]
+```
+
+# 2. Quality control (FastQC)
+
+FastQC was run on the first 100,000 reads (read 1) of one untreated sample (SRR1039508) and one treated sample (SRR1039509). Reports are in `results/fastqc/`.
+
+**Observations (from the FastQC summary of both samples):**
+
+- Both samples passed 10 of the 11 FastQC modules, including per base sequence quality, per sequence quality scores, per base N content, per sequence GC content, sequence duplication levels and adapter content.
+- No adapter contamination was detected, so adapter trimming was not required.
+- Both samples raised a warning for "Overrepresented sequences". In RNA-Seq this can happen when a few highly expressed transcripts account for a large share of reads. These sequences were not investigated further here.
+- The two samples gave the same pattern of results, so neither looked like an outlier on read quality.
+
+Note: FastQC was run on a subset of reads from two samples to demonstrate the QC step. The differential expression analysis below uses the full gene-level count matrix from the `airway` package.
+
+# 3. Filtering and normalisation
+
+Genes with fewer than 10 reads in at least 4 samples were removed because low-count genes carry little statistical information. DESeq2 normalises library size with the median-of-ratios method, and a variance stabilising transformation (VST) is used for plots.
+
+```{r filter}
+cat("Genes before filtering:", nrow(dds), "\n")
+dds <- dds[rowSums(counts(dds) >= 10) >= 4, ]
+cat("Genes after filtering:", nrow(dds), "\n")
+```
+
+# 4. Differential expression (DESeq2)
+
+Model: `~ cell + dex`, so the donor (cell line) effect is accounted for. Contrast: treated vs untreated. A gene is called differentially expressed if adjusted p < 0.05 and |log2 fold change| >= 1.
+
+```{r deseq, message=FALSE}
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("dex", "trt", "untrt"), alpha = 0.05)
+summary(res)
+
+res_df <- as.data.frame(res)
+res_df$ensembl <- rownames(res_df)
+res_df$symbol <- unname(mapIds(org.Hs.eg.db, keys = res_df$ensembl,
+                               column = "SYMBOL", keytype = "ENSEMBL",
+                               multiVals = "first"))
+res_df <- res_df %>%
+  filter(!is.na(padj)) %>%
+  mutate(status = case_when(
+    padj < 0.05 & log2FoldChange >= 1  ~ "Up",
+    padj < 0.05 & log2FoldChange <= -1 ~ "Down",
+    TRUE ~ "NS"))
+write.csv(res_df, "results/DE_results.csv", row.names = FALSE)
+table(res_df$status)
+```
+
+# 5. Sample relationships (PCA)
+
+```{r pca}
+vsd <- vst(dds, blind = FALSE)
+plotPCA(vsd, intgroup = c("dex", "cell"))
+```
+
+Samples separate by treatment and by donor, which is why `cell` is included in the model.
+
+# 6. Volcano plot
+
+```{r volcano, fig.width=8, fig.height=6}
+lab <- res_df %>%
+  filter(status != "NS", !is.na(symbol)) %>%
+  arrange(padj) %>%
+  head(12)
+
+ggplot(res_df, aes(log2FoldChange, -log10(padj), colour = status)) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_colour_manual(values = c(Down = "#2a6fdb", NS = "grey75", Up = "#d6453d")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_text_repel(data = lab, aes(label = symbol), colour = "black",
+                  size = 3, max.overlaps = 20) +
+  theme_bw() +
+  labs(title = "Dexamethasone vs untreated",
+       x = "log2 fold change", y = "-log10 adjusted p-value")
+```
+
+# 7. Heatmap of top differentially expressed genes
+
+The 30 most significant genes (by adjusted p-value), shown as row-scaled VST expression.
+
+```{r heatmap, fig.width=8, fig.height=8}
+top <- res_df %>%
+  filter(status != "NS", !is.na(symbol)) %>%
+  arrange(padj) %>%
+  head(30)
+
+mat <- assay(vsd)[top$ensembl, ]
+rownames(mat) <- top$symbol
+colnames(mat) <- paste0(vsd$cell, "_", vsd$dex)
+ann <- data.frame(Treatment = vsd$dex, row.names = colnames(mat))
+
+pheatmap(mat, scale = "row", annotation_col = ann,
+         clustering_method = "ward.D2", fontsize_row = 8,
+         main = "Top 30 DE genes (row z-score of VST)")
+```
+
+# 8. Top up- and down-regulated genes
+
+```{r top-tables}
+cat("Top 10 up-regulated genes\n")
+res_df %>% filter(status == "Up") %>% arrange(desc(log2FoldChange)) %>%
+  select(symbol, log2FoldChange, padj) %>% head(10)
+
+cat("Top 10 down-regulated genes\n")
+res_df %>% filter(status == "Down") %>% arrange(log2FoldChange) %>%
+  select(symbol, log2FoldChange, padj) %>% head(10)
+```
+
+# 9. Gene Ontology (GO) enrichment
+
+GO "Biological Process" enrichment was done with topGO (Fisher's exact test, `weight01` algorithm). The background (universe) is all genes that passed filtering and were tested, and the test set is all DE genes (up and down).
+
+```{r go, message=FALSE, warning=FALSE}
+all_genes <- res_df$ensembl
+de_genes <- res_df$ensembl[res_df$status != "NS"]
+gene_list <- factor(as.integer(all_genes %in% de_genes))
+names(gene_list) <- all_genes
+
+go_data <- new("topGOdata",
+               ontology = "BP",
+               allGenes = gene_list,
+               annot = annFUN.org,
+               mapping = "org.Hs.eg.db",
+               ID = "ensembl",
+               nodeSize = 10)
+
+go_test <- runTest(go_data, algorithm = "weight01", statistic = "fisher")
+go_tab <- GenTable(go_data, Fisher = go_test, orderBy = "Fisher",
+                   topNodes = 15, numChar = 70)
+go_tab$Fisher <- as.numeric(go_tab$Fisher)
+write.csv(go_tab, "results/GO_BP_enrichment.csv", row.names = FALSE)
+go_tab
+```
+
+```{r go-plot, fig.width=9, fig.height=6}
+go_tab$Term <- factor(go_tab$Term, levels = rev(go_tab$Term))
+ggplot(go_tab, aes(Term, -log10(Fisher))) +
+  geom_col(fill = "#264653") +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "Top enriched GO Biological Processes",
+       x = NULL, y = "-log10 p-value (Fisher, weight01)")
+```
+
+# 10. Interpretation
+
+**How many genes changed?** Of 15,826 genes tested after filtering, 951 were differentially expressed (adjusted p < 0.05 and |log2 fold change| >= 1): 490 were up-regulated and 461 were down-regulated by dexamethasone.
+
+**Which genes stand out?** The most strongly induced genes included ALOX15B, ZBTB16, STEAP4, ANGPTL7 and FAM107A. ZBTB16 and FAM107A have been reported as glucocorticoid-responsive, which supports that the treatment effect was captured. Among down-regulated genes, VCAM1 was the most statistically significant (adjusted p about 1.9e-81), and the chemokine CCL7 was also reduced. Both are linked to inflammation, which fits the anti-inflammatory action of glucocorticoids. The top-up and top-down lists are ranked by fold change, whereas the heatmap shows the most significant genes.
+
+**What do the GO terms say?** The top enriched Biological Process terms included angiogenesis, extracellular matrix organisation, retinol and retinoic acid metabolic processes, and immune response. This suggests that dexamethasone affects tissue remodelling and inflammatory signalling in airway smooth muscle cells. Some top terms (for example axon guidance and cranial nerve morphogenesis) are broad developmental terms that often arise from shared signalling and matrix genes, so they should be interpreted cautiously.
+
+**Limitations.** Only 4 donors and one cell type were used. Gene-level counts came from the `airway` package and were not re-aligned from raw reads. GO p-values are not corrected for multiple testing, and enrichment shows association, not causation. FastQC was run on a subset of reads from two samples only.
+
+# 11. Reproducibility
+
+Run `rmarkdown::render("Task2_RNAseq_DESeq2.Rmd")` from the project folder. Required R packages: DESeq2, airway, org.Hs.eg.db, topGO, GO.db, ggplot2, ggrepel, pheatmap, dplyr, rmarkdown.
+
+```{r session}
+sessionInfo()
+```

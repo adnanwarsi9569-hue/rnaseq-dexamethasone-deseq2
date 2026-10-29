@@ -1,0 +1,4 @@
+data/fastq/
+*.knit.md
+.Rhistory
+.RData
